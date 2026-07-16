@@ -1,10 +1,8 @@
 import os
-import hashlib
 import numpy as np
 import torch
-import torch.nn as nn
 from PIL import Image
-from morgana_model import MorganaPixelGenerator
+from diffusers import StableDiffusionPipeline, AutoencoderTiny
 
 # Definitive hardware-accurate retro palettes
 PALETTES = {
@@ -71,281 +69,56 @@ PALETTES = {
 
 class MorganaPipeline:
     """
-    MorganaPipeline - Manages text encoding, neural image generation,
-    and retro post-processing (pixelation, limited palette quantization, and dithering).
-
-    Supports TWO modes:
-    1. Genuine Stable Diffusion Mode: Uses 'segmind/tiny-sd' + 'madebyollin/taesd' for
-       state-of-the-art neural generation under 500MB, running optimized on CPU.
-    2. Ultra-Lightweight Local Neural Mode (Default / Offline): Runs our custom PyTorch network
-       combined with prompt-driven structural synthesis for offline fast-CPU performance with 0 MB download!
+    MorganaPipeline - Manages genuine text-to-pixel-art generation using a 100% real,
+    fully-trained, open-source model: 'segmind/tiny-sd' + 'madebyollin/taesd' (Tiny VAE),
+    which is optimized to fit under 500MB and run flawlessly on CPU.
     """
-    def __init__(self, use_sd=False, fallback_to_local=True):
+    def __init__(self, model_id="segmind/tiny-sd", vae_id="madebyollin/taesd"):
         self.device = torch.device("cpu")
-        self.use_sd = use_sd
-        self.sd_pipeline = None
-        self.fallback_to_local = fallback_to_local
+        print(f"[*] Loading genuine pre-trained Stable Diffusion pipeline: {model_id}...")
 
-        # 1. Try loading genuine Stable Diffusion pipeline if requested
-        if self.use_sd:
-            try:
-                from diffusers import StableDiffusionPipeline, AutoencoderTiny
-                print("[*] Loading genuine Stable Diffusion model 'segmind/tiny-sd' with TAESD (< 500MB)...")
-                self.sd_pipeline = StableDiffusionPipeline.from_pretrained(
-                    "segmind/tiny-sd",
-                    torch_dtype=torch.float32,
-                    safety_checker=None
-                )
-                self.sd_pipeline.vae = AutoencoderTiny.from_pretrained("madebyollin/taesd", torch_dtype=torch.float32)
-                self.sd_pipeline = self.sd_pipeline.to(self.device)
-                print("[+] Successfully loaded segmind/tiny-sd + TAESD!")
-            except Exception as e:
-                print(f"[-] Could not load Stable Diffusion: {e}. Falling back to lightweight local mode.")
-                self.use_sd = False
+        # Load real pre-trained stable diffusion model
+        self.pipe = StableDiffusionPipeline.from_pretrained(
+            model_id,
+            torch_dtype=torch.float32,
+            safety_checker=None
+        )
 
-        # 2. Setup the local custom generative model as a lightweight default or fallback
-        self.model = MorganaPixelGenerator().to(self.device)
-        self.model.eval()
-        self._initialize_procedural_weights()
+        # Swap standard heavy VAE with Tiny Autoencoder (TAESD) to keep size under 500MB
+        if vae_id:
+            print(f"[*] Swapping VAE with ultra-lightweight Tiny Autoencoder: {vae_id} (~9MB)...")
+            self.pipe.vae = AutoencoderTiny.from_pretrained(vae_id, torch_dtype=torch.float32)
 
-    def _initialize_procedural_weights(self):
-        """
-        Initialize local generator weights with structured mathematical shapes,
-        sinusoidal textures, and noise filters to produce clean geometric features.
-        """
-        torch.manual_seed(42)
-        with torch.no_grad():
-            for name, param in self.model.named_parameters():
-                if "weight" in name:
-                    if len(param.shape) >= 2:
-                        nn.init.orthogonal_(param, gain=0.8)
-                    else:
-                        nn.init.constant_(param, 0.0)
-                elif "bias" in name:
-                    nn.init.constant_(param, 0.0)
-
-    def _local_text_encode(self, prompt):
-        """
-        Extremely fast offline text embedding encoder for local fallback mode.
-        """
-        embedding = np.zeros(384, dtype=np.float32)
-        prompt_lower = prompt.lower()
-
-        hash_digest = hashlib.sha256(prompt_lower.encode('utf-8')).digest()
-        for i in range(12):
-            seed = int.from_bytes(hash_digest[i*2:i*2+2], byteorder='big')
-            np.random.seed(seed)
-            idx = np.random.randint(0, 384, size=32)
-            embedding[idx] += np.random.randn(32)
-
-        keywords = {
-            "sky": (0, 48, 1.2),
-            "sunset": (48, 96, 1.5),
-            "castle": (96, 144, 1.8),
-            "forest": (144, 192, 1.3),
-            "sea": (192, 240, 1.4),
-            "space": (240, 288, 1.6),
-            "dragon": (288, 336, 1.7),
-            "mountain": (336, 384, 1.4),
-            "famicom": (10, 100, 1.5),
-            "gameboy": (100, 200, 1.5),
-            "sword": (200, 300, 1.6),
-            "hero": (300, 380, 1.7)
-        }
-
-        for key, (start, end, multiplier) in keywords.items():
-            if key in prompt_lower:
-                embedding[start:end] *= multiplier
-                embedding[start:end] += 0.5
-
-        norm = np.linalg.norm(embedding)
-        if norm > 0:
-            embedding = embedding / norm
-
-        return torch.tensor(embedding).unsqueeze(0)
+        self.pipe = self.pipe.to(self.device)
+        print("[+] Genuine pipeline loaded successfully!")
 
     def generate_raw(self, prompt, seed=None):
         """
-        Generates the raw structural image from the chosen neural model.
+        Generates the raw structural image from the genuine Stable Diffusion neural network.
         """
-        # If in genuine Stable Diffusion mode, use segmind/tiny-sd
-        if self.use_sd and self.sd_pipeline is not None:
-            generator = torch.Generator(device="cpu")
-            if seed is not None:
-                generator.manual_seed(seed)
-            else:
-                prompt_hash = int(hashlib.sha256(prompt.lower().encode('utf-8')).hexdigest()[:8], 16)
-                generator.manual_seed(prompt_hash)
-
-            # Enhancing the user prompt to enforce premium retro pixel art styling inside the SD model
-            pixel_prompt = f"pixel art, retro game style, crisp details, {prompt}"
-            negative_prompt = "photorealistic, smooth gradients, blur, anti-aliasing, 3d render"
-
-            # Generate via real UNet with low steps for maximum CPU speed
-            with torch.no_grad():
-                sd_out = self.sd_pipeline(
-                    pixel_prompt,
-                    negative_prompt=negative_prompt,
-                    num_inference_steps=5, # 5 steps is lightning fast on CPU!
-                    guidance_scale=6.5,
-                    generator=generator
-                ).images[0]
-            return np.array(sd_out)
-
-        # Local neural mode (fallback / offline)
+        generator = torch.Generator(device="cpu")
         if seed is not None:
-            torch.manual_seed(seed)
-            np.random.seed(seed)
+            generator.manual_seed(seed)
 
-        embedding = self._local_text_encode(prompt).to(self.device)
-
-        prompt_hash = int(hashlib.sha256(prompt.lower().encode('utf-8')).hexdigest()[:8], 16)
-        torch.manual_seed(seed if seed is not None else prompt_hash)
+        # Enhancing user prompt to direct the model towards premium pixel art
+        styled_prompt = f"pixel art, retro game style, detailed, {prompt}"
+        negative_prompt = "photorealistic, realistic, 3d render, blurry, smooth gradient"
 
         with torch.no_grad():
-            raw_out = self.model(embedding)
+            sd_out = self.pipe(
+                styled_prompt,
+                negative_prompt=negative_prompt,
+                num_inference_steps=6,  # 6 steps is extremely fast on CPU
+                guidance_scale=7.0,
+                generator=generator
+            ).images[0]
 
-        raw_out = raw_out.squeeze(0).cpu().permute(1, 2, 0).numpy()
-        raw_out = ((raw_out + 1.0) * 127.5)
-        raw_out = np.clip(raw_out, 0, 255)
-
-        # Apply procedural semantic mapping to inject retro structure
-        raw_out = self._apply_procedural_composition(prompt.lower(), raw_out)
-        return raw_out
-
-    def _apply_procedural_composition(self, prompt, img_np):
-        """
-        Applies beautiful structural rules directly to local latent space based on prompt.
-        """
-        h, w, c = img_np.shape
-        out = img_np.copy()
-
-        is_sunset = "sunset" in prompt or "sun" in prompt or "retro" in prompt
-        is_space = "space" in prompt or "star" in prompt or "galaxy" in prompt or "cosmic" in prompt
-        is_sky = "sky" in prompt or "cloud" in prompt or is_sunset or is_space
-
-        if is_sky:
-            for y in range(h):
-                factor = y / h
-                if is_sunset:
-                    out[y, :, 0] += (1.0 - factor) * 80.0  # Red
-                    out[y, :, 1] += (0.5 - factor) * 40.0  # Green
-                    out[y, :, 2] -= factor * 60.0          # Blue
-                elif is_space:
-                    out[y, :, 0] = out[y, :, 0] * 0.3 + (factor * 20.0)
-                    out[y, :, 1] = out[y, :, 1] * 0.2
-                    out[y, :, 2] = out[y, :, 2] * 0.5 + (factor * 40.0)
-                    np.random.seed(y * 12345)
-                    star_cols = np.random.randint(0, w, size=3)
-                    for col in star_cols:
-                        if np.random.rand() > 0.85:
-                            out[y, col, :] = 255.0
-                else:
-                    out[y, :, 0] -= factor * 50.0
-                    out[y, :, 1] += (1.0 - factor) * 40.0
-                    out[y, :, 2] += (1.0 - factor) * 80.0
-
-        is_sea = "sea" in prompt or "ocean" in prompt or "water" in prompt or "river" in prompt
-        is_forest = "forest" in prompt or "tree" in prompt or "nature" in prompt or "grass" in prompt
-        is_castle = "castle" in prompt or "palace" in prompt or "tower" in prompt or "ruins" in prompt
-        is_mountain = "mountain" in prompt or "hill" in prompt or "rock" in prompt
-
-        if is_sea:
-            horizon = int(h * 0.55)
-            for y in range(horizon, h):
-                factor = (y - horizon) / (h - horizon)
-                out[y, :, 0] = out[y, :, 0] * 0.2
-                out[y, :, 1] = out[y, :, 1] * 0.4 + (factor * 50.0)
-                out[y, :, 2] = out[y, :, 2] * 0.8 + (factor * 120.0)
-                wave_pattern = np.sin(np.arange(w) * 0.2 + y * 0.5) * 4.0
-                if y % 8 == 0:
-                    for x in range(w):
-                        if abs(wave_pattern[x]) < 1.0:
-                            out[y, x, :] = 220.0
-
-        elif is_forest:
-            horizon = int(h * 0.5)
-            for y in range(horizon, h):
-                factor = (y - horizon) / (h - horizon)
-                out[y, :, 0] = out[y, :, 0] * 0.3
-                out[y, :, 1] = out[y, :, 1] * 0.8 + (1.0 - factor) * 60.0
-                out[y, :, 2] = out[y, :, 2] * 0.3
-
-            np.random.seed(98765)
-            tree_positions = np.random.randint(10, w - 10, size=5)
-            for tx in tree_positions:
-                out[horizon-10:h, tx-1:tx+2, 0] = 101.0
-                out[horizon-10:h, tx-1:tx+2, 1] = 67.0
-                out[horizon-10:h, tx-1:tx+2, 2] = 33.0
-                for cy in range(horizon-25, horizon-10):
-                    r_leaf = 8 - abs(cy - (horizon-17))
-                    out[cy, tx-r_leaf : tx+r_leaf+1, 0] = 34.0
-                    out[cy, tx-r_leaf : tx+r_leaf+1, 1] = 139.0
-                    out[cy, tx-r_leaf : tx+r_leaf+1, 2] = 34.0
-
-        if is_mountain:
-            np.random.seed(54321)
-            peaks = [(w // 3, h // 2, 40), (w * 2 // 3, h // 2 - 10, 50)]
-            for px, py, size in peaks:
-                for y in range(py - size, py + size):
-                    spread = size - abs(y - py)
-                    if py - size <= y < h:
-                        out[y, max(0, px - spread) : min(w, px + spread), 0] = 120.0
-                        out[y, max(0, px - spread) : min(w, px + spread), 1] = 120.0
-                        out[y, max(0, px - spread) : min(w, px + spread), 2] = 135.0
-
-        if is_castle:
-            cx = w // 2
-            cy = h // 2
-            out[cy:cy+40, cx-25:cx+25, 0] = 140.0
-            out[cy:cy+40, cx-25:cx+25, 1] = 140.0
-            out[cy:cy+40, cx-25:cx+25, 2] = 150.0
-            out[cy-15:cy+40, cx-25:cx-15, :] = 110.0
-            out[cy-15:cy+40, cx+15:cx+25, :] = 110.0
-            for r in range(12):
-                out[cy-27+r, cx-25+r : cx-15-r, 0] = 200.0
-                out[cy-27+r, cx-25+r : cx-15-r, 1] = 50.0
-                out[cy-27+r, cx-25+r : cx-15-r, 2] = 50.0
-
-                out[cy-27+r, cx+15+r : cx+25-r, 0] = 200.0
-                out[cy-27+r, cx+15+r : cx+25-r, 1] = 50.0
-                out[cy-27+r, cx+15+r : cx+25-r, 2] = 50.0
-            out[cy+25:cy+40, cx-6:cx+6, :] = 40.0
-            out[cy+5:cy+12, cx-3:cx+3, 0] = 240.0
-            out[cy+5:cy+12, cx-3:cx+3, 1] = 200.0
-            out[cy+5:cy+12, cx-3:cx+3, 2] = 50.0
-
-        is_character = any(k in prompt for k in ["hero", "sword", "dragon", "monster", "character", "knight", "player"])
-        if is_character:
-            cx, cy = w // 2, h * 2 // 3
-            if "dragon" in prompt or "monster" in prompt:
-                for r in range(15):
-                    out[cy-10+r, cx-r:cx+r, 0] = 220.0
-                    out[cy-10+r, cx-r:cx+r, 1] = 20.0
-                    out[cy-10+r, cx-r:cx+r, 2] = 60.0
-                out[cy-5:cy+5, cx-25:cx-12, 0] = 139.0
-                out[cy-5:cy+5, cx-25:cx-12, 1] = 0.0
-                out[cy-5:cy+5, cx+12:cx+25, 0] = 139.0
-                out[cy-5:cy+5, cx+12:cx+25, 1] = 0.0
-            elif "sword" in prompt or "knight" in prompt or "hero" in prompt:
-                out[cy-15:cy+15, cx-8:cx+8, 0] = 192.0
-                out[cy-15:cy+15, cx-8:cx+8, 1] = 192.0
-                out[cy-15:cy+15, cx-8:cx+8, 2] = 210.0
-                out[cy-10:cy+15, cx-12:cx-8, 0] = 180.0
-                out[cy-10:cy+15, cx-12:cx-8, 1] = 10.0
-                out[cy-25:cy, cx+10:cx+12, 0] = 255.0
-                out[cy-25:cy, cx+10:cx+12, 1] = 215.0
-                out[cy-25:cy, cx+10:cx+12, 2] = 0.0
-                out[cy:cy+3, cx+8:cx+14, 0] = 139.0
-                out[cy:cy+3, cx+8:cx+14, 1] = 69.0
-                out[cy:cy+3, cx+8:cx+14, 2] = 19.0
-
-        return np.clip(out, 0, 255)
+        return np.array(sd_out)
 
     def process_pixel_art(self, img_np, palette_name="gameboy", target_size=(256, 256), dither_strength=1.0, dither_type="bayer"):
         """
-        Main post-processor: downsamples image to retro resolution,
-        applies palette quantization, and performs hardware-accurate dithering.
+        Post-processor: downsamples the output image to authentic retro grid resolution,
+        applies Euclidean color palette quantization, and performs hardware dithering.
         """
         p_name = palette_name.lower()
         if p_name not in PALETTES:
@@ -353,6 +126,7 @@ class MorganaPipeline:
 
         palette = PALETTES[p_name]
 
+        # Establish hardware-accurate retro resolutions
         if p_name == "gameboy":
             pixel_res = (160, 144)
         elif p_name in ["famicom", "c64"]:
@@ -366,6 +140,7 @@ class MorganaPipeline:
         low_res_img = pil_img.resize(pixel_res, Image.Resampling.BILINEAR)
         low_res_np = np.array(low_res_img, dtype=np.float32)
 
+        # Apply dither matrices
         if dither_strength > 0:
             if dither_type == "bayer":
                 quantized_np = self._quantize_and_dither_bayer(low_res_np, palette, dither_strength)
@@ -374,6 +149,7 @@ class MorganaPipeline:
         else:
             quantized_np = self._quantize_direct(low_res_np, palette)
 
+        # Upscale using NEAREST NEIGHBOR to keep pixel boundaries perfectly crisp and non-blurry!
         final_pil = Image.fromarray(quantized_np)
         final_img = final_pil.resize(target_size, Image.Resampling.NEAREST)
         return final_img
@@ -390,6 +166,7 @@ class MorganaPipeline:
         h, w, c = img_np.shape
         palette_arr = np.array(palette, dtype=np.float32)
 
+        # 4x4 Bayer ordered dithering matrix
         bayer = np.array([
             [0,  8,  2,  10],
             [12, 4,  14, 6],
