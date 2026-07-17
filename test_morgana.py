@@ -73,3 +73,19 @@ def test_palette_and_quantization():
     for color in unique_colors:
         color_tuple = tuple(color)
         assert color_tuple in expected_palette, f"Pixel color {color_tuple} not found in GameBoy palette: {expected_palette}"
+
+
+def test_morgana_pipeline_offline_mode():
+    """
+    Verify image generation when use_sd=False and assert output correctness.
+    """
+    pipeline = MorganaPipeline(use_sd=False)
+    img = pipeline.generate(
+        prompt="mystic wizard under moonlight",
+        palette_name="pico8",
+        target_size=(256, 256),
+        dither_strength=1.0,
+        dither_type="bayer"
+    )
+    assert isinstance(img, Image.Image), "Output should be a PIL Image"
+    assert img.size == (256, 256), f"Expected size (256, 256), got {img.size}"
