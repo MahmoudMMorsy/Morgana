@@ -23,14 +23,21 @@ def test_morgana_pipeline_initialization():
     """
     Test that the generation pipeline loads cleanly.
     """
-    pipeline = MorganaPipeline()
+    pipeline = MorganaPipeline(use_sd=True)
     assert pipeline.pipe is not None
+
+def test_morgana_pipeline_offline_initialization():
+    """
+    Test that the generation pipeline loads cleanly in offline mode.
+    """
+    pipeline = MorganaPipeline(use_sd=False)
+    assert pipeline.generator is not None
 
 def test_morgana_pipeline_generation():
     """
     Test generating a full pixel-art image from a prompt.
     """
-    pipeline = MorganaPipeline()
+    pipeline = MorganaPipeline(use_sd=True)
 
     start_time = time.time()
     img = pipeline.generate(
@@ -45,6 +52,27 @@ def test_morgana_pipeline_generation():
     assert isinstance(img, Image.Image), "Output should be a PIL Image"
     assert img.size == (256, 256), f"Expected size (256, 256), got {img.size}"
     print(f"\n[INFO] Generated pixel art in {elapsed:.3f} seconds.")
+
+def test_morgana_pipeline_offline_generation():
+    """
+    Test generating a full pixel-art image from a prompt using offline mode.
+    """
+    pipeline = MorganaPipeline(use_sd=False)
+
+    start_time = time.time()
+    img = pipeline.generate(
+        prompt="retro gameboy hero with a glowing sword",
+        palette_name="gameboy",
+        target_size=(256, 256),
+        dither_strength=1.0,
+        dither_type="bayer",
+        seed=42
+    )
+    elapsed = time.time() - start_time
+
+    assert isinstance(img, Image.Image), "Output should be a PIL Image"
+    assert img.size == (256, 256), f"Expected size (256, 256), got {img.size}"
+    print(f"\n[INFO] Generated offline pixel art in {elapsed:.3f} seconds.")
 
 def test_palette_and_quantization():
     """

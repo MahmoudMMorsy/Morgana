@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from PIL import Image
 from diffusers import StableDiffusionPipeline, AutoencoderTiny
+from morgana_model import MorganaPixelGenerator
 
 # Definitive hardware-accurate retro palettes
 PALETTES = {
@@ -72,30 +73,68 @@ class MorganaPipeline:
     MorganaPipeline - Manages genuine text-to-pixel-art generation using a 100% real,
     fully-trained, open-source model: 'segmind/tiny-sd' + 'madebyollin/taesd' (Tiny VAE),
     which is optimized to fit under 500MB and run flawlessly on CPU.
+    Also supports a local procedural neural fallback (highly efficient offline mode).
     """
-    def __init__(self, model_id="segmind/tiny-sd", vae_id="madebyollin/taesd"):
+    def __init__(self, use_sd=True, model_id="segmind/tiny-sd", vae_id="madebyollin/taesd"):
         self.device = torch.device("cpu")
-        print(f"[*] Loading genuine pre-trained Stable Diffusion pipeline: {model_id}...")
+        self.use_sd = use_sd
 
-        # Load real pre-trained stable diffusion model
-        self.pipe = StableDiffusionPipeline.from_pretrained(
-            model_id,
-            torch_dtype=torch.float32,
-            safety_checker=None
-        )
+        if self.use_sd:
+            print(f"[*] Loading genuine pre-trained Stable Diffusion pipeline: {model_id}...")
 
-        # Swap standard heavy VAE with Tiny Autoencoder (TAESD) to keep size under 500MB
-        if vae_id:
-            print(f"[*] Swapping VAE with ultra-lightweight Tiny Autoencoder: {vae_id} (~9MB)...")
-            self.pipe.vae = AutoencoderTiny.from_pretrained(vae_id, torch_dtype=torch.float32)
+            # Load real pre-trained stable diffusion model
+            self.pipe = StableDiffusionPipeline.from_pretrained(
+                model_id,
+                torch_dtype=torch.float32,
+                safety_checker=None
+            )
 
-        self.pipe = self.pipe.to(self.device)
-        print("[+] Genuine pipeline loaded successfully!")
+            # Swap standard heavy VAE with Tiny Autoencoder (TAESD) to keep size under 500MB
+            if vae_id:
+                print(f"[*] Swapping VAE with ultra-lightweight Tiny Autoencoder: {vae_id} (~9MB)...")
+                self.pipe.vae = AutoencoderTiny.from_pretrained(vae_id, torch_dtype=torch.float32)
+
+            self.pipe = self.pipe.to(self.device)
+            print("[+] Genuine pipeline loaded successfully!")
+        else:
+            print("[*] Initializing ultra-lightweight offline MorganaPixelGenerator...")
+            # Seed PyTorch weight initialization deterministically so that the offline model is stable across runs
+            torch.manual_seed(42)
+            self.generator = MorganaPixelGenerator(embedding_dim=384, base_channels=64)
+            self.generator.eval()
+            print("[+] Offline generator initialized successfully!")
+
+    def _prompt_to_embedding(self, prompt, seed=None):
+        """
+        Deterministically maps a text prompt and seed to a 384-dimensional embedding vector.
+        """
+        import hashlib
+        seed_str = f"{prompt}_{seed if seed is not None else ''}"
+        hasher = hashlib.sha256(seed_str.encode('utf-8'))
+        hash_seed = int(hasher.hexdigest(), 16) % (2**32)
+
+        np_gen = np.random.RandomState(hash_seed)
+        embedding_np = np_gen.normal(0.0, 1.0, (384,)).astype(np.float32)
+        return torch.from_numpy(embedding_np)
 
     def generate_raw(self, prompt, seed=None):
         """
-        Generates the raw structural image from the genuine Stable Diffusion neural network.
+        Generates the raw structural image from either the genuine Stable Diffusion neural network
+        or the local offline MorganaPixelGenerator depending on initialization mode.
         """
+        if not self.use_sd:
+            with torch.no_grad():
+                embedding = self._prompt_to_embedding(prompt, seed)
+                # Ensure batch dimension
+                embedding = embedding.unsqueeze(0)
+                output = self.generator(embedding) # Shape (1, 3, 128, 128)
+
+                # Convert Tanh output [-1, 1] to [0, 255]
+                img_tensor = (output.squeeze(0) + 1.0) * 127.5
+                img_tensor = img_tensor.clamp(0, 255)
+                img_np = img_tensor.permute(1, 2, 0).cpu().numpy().astype(np.uint8)
+            return img_np
+
         generator = torch.Generator(device="cpu")
         if seed is not None:
             generator.manual_seed(seed)
