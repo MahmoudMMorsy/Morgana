@@ -89,3 +89,32 @@ def test_morgana_pipeline_offline_mode():
     )
     assert isinstance(img, Image.Image), "Output should be a PIL Image"
     assert img.size == (256, 256), f"Expected size (256, 256), got {img.size}"
+
+
+def test_floyd_steinberg_dithering():
+    """
+    Verify that our optimized Floyd-Steinberg dithering function produces the
+    correct PIL Image, has no runtime errors, and successfully maps output pixels.
+    """
+    pipeline = MorganaPipeline(use_sd=False)
+    raw_img = np.random.randint(0, 256, (128, 128, 3), dtype=np.uint8)
+
+    processed_img = pipeline.process_pixel_art(
+        img_np=raw_img,
+        palette_name="gameboy",
+        target_size=(160, 144),
+        dither_strength=1.0,
+        dither_type="floyd"
+    )
+
+    assert isinstance(processed_img, Image.Image), "Output should be a PIL Image"
+    assert processed_img.size == (160, 144), f"Expected size (160, 144), got {processed_img.size}"
+
+    # Verify that the color channels are clipped and only retro palette colors are used
+    processed_np = np.array(processed_img)
+    unique_colors = np.unique(processed_np.reshape(-1, 3), axis=0)
+    expected_palette = PALETTES["gameboy"]
+
+    for color in unique_colors:
+        color_tuple = tuple(color)
+        assert color_tuple in expected_palette, f"Pixel color {color_tuple} not found in GameBoy palette."
